@@ -221,12 +221,12 @@ class Backtester:
         if result.total_trades > 0:
             result.win_rate = (result.winning_trades / result.total_trades) * 100
 
-        # P&L totals
+        # P&L totals — use actual per-trade rupees (handles variable lot sizes)
         result.total_pnl_points = sum(t.pnl_points for t in self.trades)
-        result.total_pnl_rupees = result.total_pnl_points * self.lot_size
+        result.total_pnl_rupees = sum(t.pnl_rupees for t in self.trades)
 
-        # Brokerage totals
-        result.total_brokerage = len(self.trades) * self.brokerage
+        # Brokerage totals — use actual per-trade brokerage
+        result.total_brokerage = sum(t.brokerage for t in self.trades)
         result.net_total_pnl_rupees = result.total_pnl_rupees - result.total_brokerage
 
         # Average win/loss
@@ -251,10 +251,13 @@ class Backtester:
                 result.avg_win_points / result.avg_loss_points
             )
 
-        # Max drawdown
+        # Max drawdown — track in rupees using actual per-trade pnl_rupees
         cumulative_pnl = 0.0
         peak_pnl = 0.0
         max_dd = 0.0
+        cumulative_rupees = 0.0
+        peak_rupees = 0.0
+        max_dd_rupees = 0.0
         for trade in self.trades:
             cumulative_pnl += trade.pnl_points
             if cumulative_pnl > peak_pnl:
@@ -263,8 +266,15 @@ class Backtester:
             if drawdown > max_dd:
                 max_dd = drawdown
 
+            cumulative_rupees += trade.pnl_rupees
+            if cumulative_rupees > peak_rupees:
+                peak_rupees = cumulative_rupees
+            dd_rupees = peak_rupees - cumulative_rupees
+            if dd_rupees > max_dd_rupees:
+                max_dd_rupees = dd_rupees
+
         result.max_drawdown_points = -max_dd  # Negative to indicate loss
-        result.max_drawdown_rupees = result.max_drawdown_points * self.lot_size
+        result.max_drawdown_rupees = -max_dd_rupees
 
         return result
 

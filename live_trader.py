@@ -48,7 +48,7 @@ def _build_result_from_trades(
         result.win_rate = (result.winning_trades / result.total_trades) * 100
 
     result.total_pnl_points = sum(t.pnl_points for t in closed)
-    result.total_pnl_rupees = result.total_pnl_points * lot_size
+    result.total_pnl_rupees = sum(t.pnl_rupees for t in closed)
     result.total_brokerage = sum(t.brokerage for t in closed)
     result.net_total_pnl_rupees = result.total_pnl_rupees - result.total_brokerage
 
@@ -71,10 +71,13 @@ def _build_result_from_trades(
     if result.avg_loss_points != 0:
         result.risk_reward_ratio = abs(result.avg_win_points / result.avg_loss_points)
 
-    # Max drawdown
+    # Max drawdown — use actual per-trade pnl_rupees
     cumulative = 0.0
     peak = 0.0
     max_dd = 0.0
+    cumulative_rupees = 0.0
+    peak_rupees = 0.0
+    max_dd_rupees = 0.0
     for t in closed:
         cumulative += t.pnl_points
         if cumulative > peak:
@@ -82,8 +85,15 @@ def _build_result_from_trades(
         dd = peak - cumulative
         if dd > max_dd:
             max_dd = dd
+
+        cumulative_rupees += t.pnl_rupees
+        if cumulative_rupees > peak_rupees:
+            peak_rupees = cumulative_rupees
+        dd_r = peak_rupees - cumulative_rupees
+        if dd_r > max_dd_rupees:
+            max_dd_rupees = dd_r
     result.max_drawdown_points = -max_dd
-    result.max_drawdown_rupees = result.max_drawdown_points * lot_size
+    result.max_drawdown_rupees = -max_dd_rupees
 
     # Date range
     result.start_date = closed[0].entry_time.astimezone(IST).strftime("%Y-%m-%d")

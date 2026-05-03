@@ -420,45 +420,49 @@ class StrikeSelector:
             logger.debug("Insufficient OTM options: %d calls, %d puts", len(otm_calls), len(otm_puts))
             return None
 
-        # Find short call: CE with |delta| closest to midpoint
-        short_call = min(
-            otm_calls,
-            key=lambda r: abs(abs(r.delta) - self.delta_midpoint),
-        )
+        # Build sets of available strikes for quick lookup
+        ce_strikes = set(r.strike_price for r in expiry_options if r.option_type == "CE" and r.close > 0)
+        pe_strikes = set(r.strike_price for r in expiry_options if r.option_type == "PE" and r.close > 0)
 
-        # Find short put: PE with |delta| closest to midpoint
-        short_put = min(
-            otm_puts,
-            key=lambda r: abs(abs(r.delta) - self.delta_midpoint),
-        )
+        # Sort OTM calls by delta proximity to target
+        sorted_calls = sorted(otm_calls, key=lambda r: abs(abs(r.delta) - self.delta_midpoint))
+        sorted_puts = sorted(otm_puts, key=lambda r: abs(abs(r.delta) - self.delta_midpoint))
 
-        # Long strikes
-        long_call_strike = short_call.strike_price + self.spread_width
-        long_put_strike = short_put.strike_price - self.spread_width
-
-        # Find the long call and long put contracts
+        # Find short call where long call (short + spread_width) also exists
+        short_call = None
         long_call = None
-        long_put = None
-        for r in expiry_options:
-            if (r.option_type == "CE" and r.strike_price == long_call_strike
-                    and r.close > 0):
-                long_call = r
-            if (r.option_type == "PE" and r.strike_price == long_put_strike
-                    and r.close > 0):
-                long_put = r
+        for candidate in sorted_calls:
+            long_strike = candidate.strike_price + self.spread_width
+            if long_strike in ce_strikes:
+                short_call = candidate
+                # Find the long call record
+                for r in expiry_options:
+                    if r.option_type == "CE" and r.strike_price == long_strike and r.close > 0:
+                        long_call = r
+                        break
+                if long_call:
+                    break
 
-        if long_call is None:
-            logger.warning(
-                "Long call strike %.0f CE not found for expiry %s",
-                long_call_strike, expiry,
-            )
+        if short_call is None or long_call is None:
+            logger.warning("No valid call spread found for expiry %s (need short + %d in data)", expiry, self.spread_width)
             return None
 
-        if long_put is None:
-            logger.warning(
-                "Long put strike %.0f PE not found for expiry %s",
-                long_put_strike, expiry,
-            )
+        # Find short put where long put (short - spread_width) also exists
+        short_put = None
+        long_put = None
+        for candidate in sorted_puts:
+            long_strike = candidate.strike_price - self.spread_width
+            if long_strike in pe_strikes:
+                short_put = candidate
+                for r in expiry_options:
+                    if r.option_type == "PE" and r.strike_price == long_strike and r.close > 0:
+                        long_put = r
+                        break
+                if long_put:
+                    break
+
+        if short_put is None or long_put is None:
+            logger.warning("No valid put spread found for expiry %s (need short - %d in data)", expiry, self.spread_width)
             return None
 
         return SelectedLegs(
@@ -660,19 +664,24 @@ class RiskProtection:
         position_is_open: bool,
         call_spread_margin_per_unit: float = 0.0,
         put_spread_margin_per_unit: float = 0.0,
+        actual_num_lots: int = 0,
     ) -> tuple[bool, str]:
         """Run all 8 risk checks in order. Returns (allowed, reason).
 
-        Margin is computed as: max(call_spread_margin, put_spread_margin) × lot_size
+        Margin is computed as: max(call_spread_margin, put_spread_margin) × quantity
         Available capital = max_total_capital + total_realized_pnl - margin_blocked
         """
+
+        # Use actual dynamic lot count if provided, else fall back to default
+        effective_lots = actual_num_lots if actual_num_lots > 0 else 1
+        effective_quantity = effective_lots * self.lot_size
 
         # Compute estimated margin for this trade
         margin_per_unit = max(call_spread_margin_per_unit, put_spread_margin_per_unit)
         if margin_per_unit <= 0:
             # Fallback: use max_loss as margin estimate
             margin_per_unit = proposed_max_loss
-        estimated_margin = margin_per_unit * self.lot_size
+        estimated_margin = margin_per_unit * effective_quantity
 
         # Available capital = starting capital + cumulative P&L - already blocked margin
         available_capital = (
@@ -690,7 +699,7 @@ class RiskProtection:
                 f"- blocked ₹{self.state.margin_blocked:.0f})"
             )
 
-        position_risk = proposed_max_loss * self.lot_size
+        position_risk = proposed_max_loss * effective_quantity
 
         # 2. Single position at a time
         if position_is_open:
@@ -963,20 +972,20 @@ class IronCondorStrategy(BaseStrategy):
     def __init__(
         self,
         *,
-        max_vix: float = 13.0,
-        short_strike_delta_min: float = 0.15,
-        short_strike_delta_max: float = 0.16,
+        max_vix: float = 18.0,
+        short_strike_delta_min: float = 0.16,
+        short_strike_delta_max: float = 0.20,
         spread_width: int = 50,
         profit_target_pct: float = 50.0,
         stop_loss_multiplier: float = 2.0,
-        entry_days_before_expiry_min: int = 5,
+        entry_days_before_expiry_min: int = 2,
         entry_days_before_expiry_max: int = 10,
         max_total_capital: float = 100_000.0,
         max_daily_loss: float = 20_000.0,
         max_weekly_loss: float = 30_000.0,
-        max_loss_pct_of_capital: float = 5.0,
+        max_loss_pct_of_capital: float = 20.0,
         max_consecutive_losses: int = 3,
-        min_premium_per_unit: float = 40.0,
+        min_premium_per_unit: float = 10.0,
         max_capital_per_position: float = 12_000.0,
         options_csv_path: str = _DEFAULT_OPTIONS_CSV,
         state_file_path: str = _DEFAULT_STATE_FILE,
@@ -1181,6 +1190,11 @@ class IronCondorStrategy(BaseStrategy):
             options = self._data_loader.get_options_at(ts) if self._data_loader else []
             nearest_expiry = self._data_loader.get_nearest_expiry(ts) if self._data_loader else None
 
+            # Use underlying_close from options data if available (handles
+            # case where candle source is the options CSV itself)
+            if options and options[0].underlying_close > 0:
+                underlying_close = options[0].underlying_close
+
         if not options:
             return None
 
@@ -1273,7 +1287,7 @@ class IronCondorStrategy(BaseStrategy):
         # Check if it's expiry day
         is_expiry_day = (current_date == expiry_date)
 
-        # Run 8 risk gates (now with proper margin check)
+        # Run 8 risk gates (pass actual dynamic quantities for accurate checks)
         allowed, reason = self._risk.check_entry_allowed(
             proposed_max_loss=max_loss_per_unit,
             net_premium_per_unit=net_premium,
@@ -1282,19 +1296,11 @@ class IronCondorStrategy(BaseStrategy):
             position_is_open=self._position_mgr.is_open,
             call_spread_margin_per_unit=call_spread_margin,
             put_spread_margin_per_unit=put_spread_margin,
+            actual_num_lots=num_lots,
         )
 
         if not allowed:
             logger.debug("Entry blocked: %s", reason)
-            return None
-
-        # Capital per position check
-        position_risk = max_loss_per_unit * self.default_lot_size
-        if position_risk > self._max_cap_per_pos:
-            logger.debug(
-                "Position risk ₹%.0f > max ₹%.0f — skipping",
-                position_risk, self._max_cap_per_pos,
-            )
             return None
 
         # Open position (with dynamic lot sizing)
@@ -1408,7 +1414,7 @@ class IronCondorStrategy(BaseStrategy):
             price=current_net,
             timestamp=ts,
             instrument=self.default_instrument,
-            quantity=self.default_lot_size,
+            quantity=pos.lot_size if pos else self.default_lot_size,
             metadata=metadata,
         )
 
@@ -1490,6 +1496,8 @@ class IronCondorStrategy(BaseStrategy):
             rs.cooldown_skipped = risk_data.get("cooldown_skipped", False)
             rs.current_day = risk_data.get("current_day")
             rs.current_week_start = risk_data.get("current_week_start")
+            rs.margin_blocked = risk_data.get("margin_blocked", 0.0)
+            rs.total_realized_pnl = risk_data.get("total_realized_pnl", 0.0)
 
         # Restore open position
         pos_data = state_data.get("position")
