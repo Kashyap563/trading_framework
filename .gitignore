@@ -1,5 +1,4 @@
 .env
-data/*.csv
 data/*.log
 data/.progress/
 __pycache__/
