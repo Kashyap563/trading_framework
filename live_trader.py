@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import time
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
@@ -148,6 +149,17 @@ class LiveTrader:
         self.fetcher = fetcher
         self.processed_timestamps: set[str] = set()
 
+        # Wire up live options provider for strategies that need option data
+        if getattr(strategy, "requires_option_data", False):
+            try:
+                from trading_framework.strategies.iron_condor import LiveOptionsProvider
+                live_provider = LiveOptionsProvider(fetcher)
+                if hasattr(strategy, "set_live_provider"):
+                    strategy.set_live_provider(live_provider)
+                    logger.info("Live options provider connected to %s", strategy.name)
+            except ImportError:
+                logger.warning("LiveOptionsProvider not available for %s", strategy.name)
+
     def run_once(self) -> None:
         """Fetch latest candles and process any new ones."""
         now = datetime.now(IST)
@@ -156,6 +168,15 @@ class LiveTrader:
         try:
             candles_1min = self.fetcher.fetch_1min_candles(today, today)
         except Exception as e:
+            error_str = str(e)
+            if "401" in error_str or "Unauthorized" in error_str:
+                logger.warning("🔑 Token expired mid-session. Attempting refresh...")
+                if self._refresh_token_from_env():
+                    logger.info("Token refreshed, retrying...")
+                    return
+                else:
+                    logger.error("Token refresh failed. Update .env and restart.")
+                    return
             logger.error("Failed to fetch intraday data: %s", e)
             return
 
@@ -196,6 +217,7 @@ class LiveTrader:
         poll_interval: int = 60,
         mode: str = "sandbox",
         output_dir: str = "",
+        daemon: bool = False,
     ) -> None:
         """Main trading loop. Runs until market close.
 
@@ -203,9 +225,21 @@ class LiveTrader:
             poll_interval: Seconds between each data fetch.
             mode: Trading mode for report naming.
             output_dir: Directory to save the report in.
+            daemon: If True, sleep after market close and resume next trading day.
         """
         logger.info("🚀 Starting %s trading loop (poll every %ds)...", mode, poll_interval)
         logger.info("💰 Strategy: %s | Lot size: %d", self.strategy.name, self.strategy.default_lot_size)
+        if daemon:
+            logger.info("🔄 DAEMON MODE: will sleep between days and resume automatically")
+
+        # Graceful shutdown handler
+        def _shutdown_handler(signum, frame):
+            logger.info("🛑 Shutdown signal received — saving state...")
+            self.strategy.on_end()
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGINT, _shutdown_handler)
+        signal.signal(signal.SIGTERM, _shutdown_handler)
 
         self.strategy.on_start()
 
@@ -245,7 +279,42 @@ class LiveTrader:
                     output_dir or ".",
                     mode,
                 )
-                break
+
+                if daemon:
+                    # Check if today was expiry day — if so, terminate the cycle
+                    # User must manually restart for the next expiry cycle
+                    strategy_pos = self.strategy.get_position()
+                    if strategy_pos == "flat":
+                        logger.info(
+                            "🔄 DAEMON: Expiry cycle complete. "
+                            "Restart manually for next cycle: "
+                            "python -m trading_framework.run --strategy %s --mode %s --daemon",
+                            self.strategy.name, mode,
+                        )
+                        break
+
+                    # Position still open (swing trade) — sleep until next trading day
+                    next_open = self._next_trading_day_open(now)
+                    sleep_seconds = (next_open - now).total_seconds()
+                    logger.info(
+                        "🔄 DAEMON: Position open, sleeping until %s (%.1f hours)",
+                        next_open.strftime("%Y-%m-%d %H:%M IST"),
+                        sleep_seconds / 3600,
+                    )
+                    time.sleep(sleep_seconds)
+
+                    # Refresh token from .env (you update it each morning)
+                    self._refresh_token_from_env()
+                    if not self._wait_for_valid_token(max_wait_minutes=30):
+                        logger.error("Cannot continue without valid token. Saving state and exiting.")
+                        self.strategy.on_end()
+                        break
+
+                    self.processed_timestamps.clear()
+                    self.strategy.on_start()
+                    continue
+                else:
+                    break
 
             try:
                 self.run_once()
@@ -257,3 +326,92 @@ class LiveTrader:
                 logger.error("Error in trading loop: %s", e)
 
             time.sleep(poll_interval)
+
+    @staticmethod
+    def _next_trading_day_open(now: datetime) -> datetime:
+        """Calculate the next trading day's market open (9:14 AM IST).
+
+        Skips weekends (Saturday/Sunday).
+        """
+        next_day = now + timedelta(days=1)
+        # Skip weekends
+        while next_day.weekday() in (5, 6):  # Saturday=5, Sunday=6
+            next_day += timedelta(days=1)
+        return datetime.combine(
+            next_day.date(),
+            dt_time(9, 14),
+            tzinfo=IST,
+        )
+
+    def _refresh_token_from_env(self) -> bool:
+        """Re-read .env file and update the fetcher's access token.
+
+        Called each morning in daemon mode to pick up a fresh token.
+        Returns True if token was updated, False if unchanged or missing.
+        """
+        framework_dir = os.path.dirname(os.path.abspath(__file__))
+        env_path = os.path.join(framework_dir, ".env")
+
+        if not os.path.exists(env_path):
+            logger.warning("No .env file found at %s", env_path)
+            return False
+
+        env: dict[str, str] = {}
+        try:
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, _, value = line.partition("=")
+                        env[key.strip()] = value.strip()
+        except Exception as exc:
+            logger.error("Failed to read .env: %s", exc)
+            return False
+
+        new_token = env.get("UPSTOX_ACCESS_TOKEN", "")
+        if not new_token or new_token == "your_access_token_here":
+            new_token = env.get("UPSTOX_SANDBOX_TOKEN", "")
+
+        if not new_token:
+            logger.warning("No access token found in .env")
+            return False
+
+        old_token = self.fetcher.access_token
+        if new_token != old_token:
+            self.fetcher.access_token = new_token
+            self.fetcher.session.headers["Authorization"] = f"Bearer {new_token}"
+            logger.info("🔑 Token refreshed from .env")
+            return True
+
+        return False
+
+    def _wait_for_valid_token(self, max_wait_minutes: int = 30) -> bool:
+        """Wait for a valid token by polling .env every 30 seconds.
+
+        Called when a 401 is detected. Gives you time to update .env
+        with a fresh token before market opens.
+
+        Returns True if a valid token was found, False if timed out.
+        """
+        logger.warning(
+            "⚠️  Token expired or invalid. Update UPSTOX_ACCESS_TOKEN in .env. "
+            "Waiting up to %d minutes...", max_wait_minutes,
+        )
+        start = time.time()
+        while (time.time() - start) < max_wait_minutes * 60:
+            if self._refresh_token_from_env():
+                # Test the new token with a simple API call
+                try:
+                    today = datetime.now(IST).date()
+                    candles = self.fetcher.fetch_1min_candles(today, today)
+                    if candles is not None:  # Even empty list means token works
+                        logger.info("✅ Token validated successfully")
+                        return True
+                except Exception:
+                    pass
+            time.sleep(30)
+
+        logger.error("❌ Token not updated within %d minutes. Stopping.", max_wait_minutes)
+        return False

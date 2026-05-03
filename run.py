@@ -180,6 +180,7 @@ def run_live(
     env: dict[str, str],
     poll_interval: int,
     verbose: bool,
+    daemon: bool = False,
 ) -> None:
     """Run live/sandbox/paper trading for the given strategy."""
     from trading_framework.data_fetcher import UpstoxDataFetcher
@@ -264,6 +265,7 @@ def run_live(
             poll_interval=poll_interval,
             mode=mode,
             output_dir=framework_dir,
+            daemon=daemon,
         )
     except KeyboardInterrupt:
         print("\nTrading stopped by user.")
@@ -339,6 +341,20 @@ def main() -> None:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Multi-day daemon mode: sleeps between market close and next open. "
+             "Use with nohup or caffeinate for laptop survival. "
+             "Example: caffeinate -s nohup python -m trading_framework.run "
+             "--strategy iron_condor --mode paper --daemon &",
+    )
+    parser.add_argument(
+        "--clear-state",
+        action="store_true",
+        help="Clear saved strategy state before starting. Use after manually "
+             "closing positions at the broker to avoid stale state.",
+    )
     args = parser.parse_args()
 
     # Configure logging
@@ -397,12 +413,20 @@ def main() -> None:
             verbose=args.verbose,
         )
     else:
+        # Clear state if requested
+        if getattr(args, "clear_state", False):
+            state_file = os.path.join(framework_dir, "iron_condor_state.json")
+            if os.path.exists(state_file):
+                os.remove(state_file)
+                print(f"🗑️  Cleared strategy state: {state_file}")
+
         run_live(
             strategy_cls=strategy_cls,
             mode=args.mode,
             env=env,
             poll_interval=args.poll,
             verbose=args.verbose,
+            daemon=getattr(args, "daemon", False),
         )
 
 

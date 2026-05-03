@@ -67,6 +67,11 @@ class ReportGenerator:
         self._create_monthly_breakdown_sheet()
         self._create_daily_pnl_sheet()
 
+        # Iron Condor-specific sheets (only if strategy is iron_condor)
+        if self.result.strategy_name == "iron_condor":
+            self._create_iron_condor_metrics_sheet()
+            self._create_expiry_cycle_sheet()
+
         if "Sheet" in self.wb.sheetnames:
             del self.wb["Sheet"]
 
@@ -375,5 +380,190 @@ class ReportGenerator:
             chart.series[0].graphicalProperties.line.width = 20000
 
             ws.add_chart(chart, "F2")
+
+        _auto_width(ws)
+
+    # ------------------------------------------------------------------
+    # Sheet 7 – Iron Condor Metrics (only for iron_condor strategy)
+    # ------------------------------------------------------------------
+
+    def _create_iron_condor_metrics_sheet(self) -> None:
+        ws = self.wb.create_sheet("IC Metrics")
+        r = self.result
+
+        ws.merge_cells("A1:C1")
+        title_cell = ws["A1"]
+        title_cell.value = "Iron Condor Strategy Metrics"
+        title_cell.font = TITLE_FONT
+
+        row = 3
+
+        def _metric(label: str, value, fmt: str | None = None) -> None:
+            nonlocal row
+            ws.cell(row=row, column=1, value=label).font = BOLD_FONT
+            cell = ws.cell(row=row, column=2, value=value)
+            if fmt:
+                cell.number_format = fmt
+            row += 1
+
+        # Extract IC-specific metrics from trade metadata
+        premiums: list[float] = []
+        days_held: list[float] = []
+        exit_reasons: dict[str, int] = {}
+        spreads: list[int] = []
+        lots_traded: list[int] = []
+
+        for trade in r.trades:
+            meta = getattr(trade, "metadata", {}) or {}
+            if "max_profit" in meta:
+                premiums.append(meta["max_profit"])
+            if "spread_width" in meta:
+                spreads.append(meta["spread_width"])
+            reason = meta.get("reason", "unknown")
+            exit_reasons[reason] = exit_reasons.get(reason, 0) + 1
+            dh = meta.get("days_held", 0)
+            if dh > 0:
+                days_held.append(dh)
+            qty = getattr(trade, "quantity", 0)
+            if qty > 0:
+                lots_traded.append(qty // 25)
+
+        total = len(r.trades)
+
+        _metric("Total Iron Condor Trades", total)
+        row += 1
+
+        # Premium metrics
+        _metric("Avg Premium Collected (per unit)", 
+                round(sum(premiums) / len(premiums), 2) if premiums else 0, "0.00")
+        _metric("Max Premium Collected (per unit)",
+                round(max(premiums), 2) if premiums else 0, "0.00")
+        _metric("Min Premium Collected (per unit)",
+                round(min(premiums), 2) if premiums else 0, "0.00")
+        row += 1
+
+        # Holding period
+        _metric("Avg Days Held",
+                round(sum(days_held) / len(days_held), 2) if days_held else 0, "0.00")
+        _metric("Max Days Held",
+                round(max(days_held), 2) if days_held else 0, "0.00")
+        _metric("Min Days Held",
+                round(min(days_held), 2) if days_held else 0, "0.00")
+        row += 1
+
+        # Lot sizing
+        _metric("Avg Lots per Trade",
+                round(sum(lots_traded) / len(lots_traded), 1) if lots_traded else 0, "0.0")
+        _metric("Max Lots in Single Trade",
+                max(lots_traded) if lots_traded else 0)
+        row += 1
+
+        # Exit reason breakdown
+        _metric("EXIT REASON BREAKDOWN", "")
+        for reason, count in sorted(exit_reasons.items(), key=lambda x: -x[1]):
+            pct = (count / total * 100) if total > 0 else 0
+            _metric(f"  {reason}", f"{count} ({pct:.1f}%)")
+
+        row += 1
+
+        # Brokerage impact
+        _metric("Brokerage per Trade", f"₹{r.trades[0].brokerage:.0f}" if r.trades else "₹0")
+        _metric("Total Brokerage", f"₹{r.total_brokerage:,.0f}")
+        if r.total_pnl_rupees != 0:
+            brokerage_pct = (r.total_brokerage / abs(r.total_pnl_rupees)) * 100
+            _metric("Brokerage as % of Gross P&L", f"{brokerage_pct:.1f}%")
+
+        _auto_width(ws)
+
+    # ------------------------------------------------------------------
+    # Sheet 8 – Expiry Cycle Breakdown (only for iron_condor strategy)
+    # ------------------------------------------------------------------
+
+    def _create_expiry_cycle_sheet(self) -> None:
+        ws = self.wb.create_sheet("Expiry Cycles")
+
+        headers = [
+            "Expiry", "Trades", "Wins", "Losses", "Win Rate %",
+            "Total P&L (pts)", "Total P&L (₹)", "Avg Days Held",
+            "Profit Target", "Stop Loss", "EOD Exit", "Other",
+        ]
+        for col_idx, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=h)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = Alignment(horizontal="center")
+
+        # Group trades by expiry from metadata
+        by_expiry: dict[str, list[Trade]] = defaultdict(list)
+        for trade in self.result.trades:
+            meta = getattr(trade, "metadata", {}) or {}
+            # Entry metadata has "expiry", exit metadata has "reason"
+            expiry = meta.get("expiry", "unknown")
+            if expiry == "unknown" and trade.entry_time:
+                # Fallback: group by week of entry
+                expiry = trade.entry_time.astimezone(IST).strftime("%Y-W%W")
+            by_expiry[expiry].append(trade)
+
+        sorted_expiries = sorted(by_expiry.keys())
+        for row_idx, expiry in enumerate(sorted_expiries, 2):
+            trades = by_expiry[expiry]
+            wins = sum(1 for t in trades if t.pnl_points > 0)
+            losses = sum(1 for t in trades if t.pnl_points < 0)
+            total_pnl_pts = sum(t.pnl_points for t in trades)
+            total_pnl_rs = sum(t.pnl_rupees for t in trades)
+            win_rate = (wins / len(trades) * 100) if trades else 0
+
+            # Days held from metadata
+            dh_list = []
+            exit_counts = {"profit_target": 0, "stop_loss": 0, "expiry_eod": 0, "other": 0}
+            for t in trades:
+                meta = getattr(t, "metadata", {}) or {}
+                dh = meta.get("days_held", 0)
+                if dh > 0:
+                    dh_list.append(dh)
+                reason = meta.get("reason", "other")
+                if reason in exit_counts:
+                    exit_counts[reason] += 1
+                else:
+                    exit_counts["other"] += 1
+
+            avg_dh = sum(dh_list) / len(dh_list) if dh_list else 0
+
+            ws.cell(row=row_idx, column=1, value=expiry)
+            ws.cell(row=row_idx, column=2, value=len(trades))
+            ws.cell(row=row_idx, column=3, value=wins)
+            ws.cell(row=row_idx, column=4, value=losses)
+            ws.cell(row=row_idx, column=5, value=round(win_rate, 1)).number_format = "0.0"
+
+            pnl_cell = ws.cell(row=row_idx, column=6, value=round(total_pnl_pts, 2))
+            pnl_cell.number_format = "0.00"
+            pnl_cell.fill = GREEN_FILL if total_pnl_pts > 0 else RED_FILL if total_pnl_pts < 0 else PatternFill()
+
+            rs_cell = ws.cell(row=row_idx, column=7, value=round(total_pnl_rs, 2))
+            rs_cell.number_format = "#,##0.00"
+            rs_cell.fill = GREEN_FILL if total_pnl_rs > 0 else RED_FILL if total_pnl_rs < 0 else PatternFill()
+
+            ws.cell(row=row_idx, column=8, value=round(avg_dh, 1)).number_format = "0.0"
+            ws.cell(row=row_idx, column=9, value=exit_counts["profit_target"])
+            ws.cell(row=row_idx, column=10, value=exit_counts["stop_loss"])
+            ws.cell(row=row_idx, column=11, value=exit_counts["expiry_eod"])
+            ws.cell(row=row_idx, column=12, value=exit_counts["other"])
+
+        # Chart: P&L by expiry cycle
+        if sorted_expiries:
+            chart = BarChart()
+            chart.title = "P&L by Expiry Cycle"
+            chart.x_axis.title = "Expiry"
+            chart.y_axis.title = "P&L (₹)"
+            chart.width = 20
+            chart.height = 12
+            chart.style = 10
+
+            data_ref = Reference(ws, min_col=7, min_row=1, max_row=len(sorted_expiries) + 1)
+            cats_ref = Reference(ws, min_col=1, min_row=2, max_row=len(sorted_expiries) + 1)
+            chart.add_data(data_ref, titles_from_data=True)
+            chart.set_categories(cats_ref)
+
+            ws.add_chart(chart, "N2")
 
         _auto_width(ws)

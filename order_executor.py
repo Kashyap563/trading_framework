@@ -201,6 +201,34 @@ class SandboxOrderExecutor(OrderExecutorBase):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {access_token}",
         })
+        self._load_existing_trades()
+
+    def _load_existing_trades(self) -> None:
+        if os.path.exists(self.trade_log_path):
+            try:
+                with open(self.trade_log_path) as f:
+                    data = json.load(f)
+                    for t in data:
+                        for key in ("entry_time", "exit_time"):
+                            if t.get(key) and isinstance(t[key], str):
+                                t[key] = datetime.fromisoformat(t[key])
+                        self.trades.append(Trade(**t))
+                    if self.trades:
+                        self._trade_counter = max(t.trade_id for t in self.trades)
+                    logger.info("Loaded %d existing sandbox trades", len(self.trades))
+            except Exception as e:
+                logger.warning("Could not load existing sandbox trades: %s", e)
+
+    def _save_trades(self) -> None:
+        serializable = []
+        for t in self.trades:
+            d = asdict(t)
+            for key in ("entry_time", "exit_time"):
+                if isinstance(d.get(key), datetime):
+                    d[key] = d[key].isoformat()
+            serializable.append(d)
+        with open(self.trade_log_path, "w") as f:
+            json.dump(serializable, f, indent=2)
 
     def _place_upstox_order(self, transaction_type: str, price: float) -> dict:
         payload = {
@@ -233,6 +261,7 @@ class SandboxOrderExecutor(OrderExecutorBase):
             tx_type = "BUY" if signal == Signal.BUY else "SELL"
             self._place_upstox_order(tx_type, action.price)
             trade = self._open_new_trade(action)
+            self._save_trades()
             logger.info("🔵 SANDBOX %s #%d: price=%.2f", tx_type, trade.trade_id, action.price)
             return trade
 
@@ -243,9 +272,12 @@ class SandboxOrderExecutor(OrderExecutorBase):
             self._place_upstox_order(tx_type, action.price)
             trade = self._close_current_trade(action)
             if trade:
+                self._save_trades()
+                emoji = "✅" if trade.pnl_points > 0 else "❌"
                 logger.info(
-                    "🔵 SANDBOX EXIT #%d: P&L=%.2f pts, net=₹%.2f",
-                    trade.trade_id, trade.pnl_points, trade.net_pnl,
+                    "%s SANDBOX EXIT #%d: P&L=%.2f pts (₹%.2f), net=₹%.2f [%s]",
+                    emoji, trade.trade_id, trade.pnl_points,
+                    trade.pnl_rupees, trade.net_pnl, trade.exit_reason,
                 )
             return trade
 
