@@ -10,7 +10,7 @@ import logging
 import os
 import signal
 import time
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
 from trading_framework.base_strategy import BaseStrategy
