@@ -182,23 +182,29 @@ def fetch_underlying_close_map(
     """Fetch Nifty 50 index 1-min candles and build a timestamp→close map.
 
     Used to populate the ``underlying_close`` column in the options CSV.
+    Chunks requests into 29-day segments to stay within API limits.
     """
     encoded = UpstoxClient.encode_key(NIFTY_INDEX_KEY)
-    url = (
-        f"{UpstoxClient.BASE_V3}/historical-candle/"
-        f"{encoded}/minutes/1/{to_date.isoformat()}/{from_date.isoformat()}"
-    )
-    data = client.get(url)
-    if data.get("status") != "success":
-        return {}
-
-    candles = data.get("data", {}).get("candles", [])
     close_map: dict[str, float] = {}
-    for c in candles:
-        try:
-            close_map[c[0]] = float(c[4])
-        except (IndexError, ValueError, TypeError):
-            pass
+
+    # Chunk into 29-day segments (API limit for 1-min candles)
+    current = from_date
+    while current <= to_date:
+        chunk_end = min(current + timedelta(days=29), to_date)
+        url = (
+            f"{UpstoxClient.BASE_V3}/historical-candle/"
+            f"{encoded}/minutes/1/{chunk_end.isoformat()}/{current.isoformat()}"
+        )
+        data = client.get(url)
+        if data.get("status") == "success":
+            candles = data.get("data", {}).get("candles", [])
+            for c in candles:
+                try:
+                    close_map[c[0]] = float(c[4])
+                except (IndexError, ValueError, TypeError):
+                    pass
+        current = chunk_end + timedelta(days=1)
+
     return close_map
 
 
@@ -425,10 +431,10 @@ def run(
             tracker.mark_done(expiry_key)
             continue
 
-        # 4. Fetch underlying close map for this expiry period
-        ul_start = max(expiry - timedelta(days=60), effective_start)
-        underlying_map = fetch_underlying_close_map(client, ul_start, expiry)
-        logger.info("  Underlying close map: %d entries", len(underlying_map))
+        # 4. Skip underlying close map — will be filled by enrich_options.py
+        #    from nifty50_intraday_1min.csv to save API calls
+        underlying_map: dict[str, float] = {}
+        logger.info("  Underlying close: deferred to enrichment step")
 
         # 5. Process each contract
         for c_idx, contract in enumerate(filtered, 1):

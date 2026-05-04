@@ -40,35 +40,71 @@ class UpstoxClient:
         self._request_count = 0
         self._last_request_time = 0.0
 
-    def get(self, url: str, timeout: int = 30) -> dict:
-        """Make a rate-limited GET request.
+    def get(self, url: str, timeout: int = 30, max_retries: int = 5) -> dict:
+        """Make a rate-limited GET request with automatic retry on 429/5xx.
 
-        Enforces ~40 req/sec (buffer from the 50/sec hard limit) and pauses
-        for 30 s every 400 requests to stay under the 2 000/30 min ceiling.
+        Enforces ~25 req/sec (safe buffer from the 50/sec hard limit) and pauses
+        for 35 s every 300 requests to stay well under the 2 000/30 min ceiling.
+        Retries with exponential backoff on 429 (Too Many Requests) and 5xx errors.
         """
-        now = time.time()
-        elapsed = now - self._last_request_time
-        if elapsed < 0.025:  # ~40 req/sec
-            time.sleep(0.025 - elapsed)
+        for attempt in range(max_retries):
+            now = time.time()
+            elapsed = now - self._last_request_time
+            if elapsed < 0.04:  # ~25 req/sec (safer than 40)
+                time.sleep(0.04 - elapsed)
 
-        self._last_request_time = time.time()
-        self._request_count += 1
+            self._last_request_time = time.time()
+            self._request_count += 1
 
-        # Every 400 requests, pause for 30 seconds (stay under 2000/30min)
-        if self._request_count % 400 == 0:
-            logger.info(
-                "Rate-limit pause (30 s) after %d requests …",
-                self._request_count,
-            )
-            time.sleep(30)
+            # Every 300 requests, pause for 35 seconds (stay under 2000/30min)
+            if self._request_count % 300 == 0:
+                logger.info(
+                    "Rate-limit pause (35 s) after %d requests …",
+                    self._request_count,
+                )
+                time.sleep(35)
 
-        try:
-            response = self.session.get(url, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as exc:
-            logger.error("API request failed: %s — %s", url, exc)
-            return {"status": "error", "message": str(exc)}
+            try:
+                response = self.session.get(url, timeout=timeout)
+
+                if response.status_code == 429:
+                    # Too Many Requests — back off and retry
+                    wait = min(30 * (2 ** attempt), 120)  # 30s, 60s, 120s
+                    logger.warning(
+                        "429 Too Many Requests (attempt %d/%d) — waiting %ds …",
+                        attempt + 1, max_retries, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+
+                if response.status_code >= 500:
+                    # Server error — retry with backoff
+                    wait = 5 * (2 ** attempt)
+                    logger.warning(
+                        "%d Server Error (attempt %d/%d) — waiting %ds …",
+                        response.status_code, attempt + 1, max_retries, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+
+                response.raise_for_status()
+                return response.json()
+
+            except requests.ConnectionError as exc:
+                wait = 10 * (2 ** attempt)
+                logger.warning(
+                    "Connection error (attempt %d/%d) — waiting %ds: %s",
+                    attempt + 1, max_retries, wait, exc,
+                )
+                time.sleep(wait)
+                continue
+
+            except requests.RequestException as exc:
+                logger.error("API request failed: %s — %s", url, exc)
+                return {"status": "error", "message": str(exc)}
+
+        logger.error("Max retries (%d) exceeded for: %s", max_retries, url)
+        return {"status": "error", "message": f"Max retries exceeded for {url}"}
 
     @staticmethod
     def encode_key(key: str) -> str:

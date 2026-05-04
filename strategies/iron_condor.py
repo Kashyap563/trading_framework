@@ -972,9 +972,9 @@ class IronCondorStrategy(BaseStrategy):
     def __init__(
         self,
         *,
-        max_vix: float = 18.0,
-        short_strike_delta_min: float = 0.16,
-        short_strike_delta_max: float = 0.20,
+        max_vix: float = 100.0,
+        short_strike_delta_min: float = 0.00,
+        short_strike_delta_max: float = 1.00,
         spread_width: int = 50,
         profit_target_pct: float = 50.0,
         stop_loss_multiplier: float = 2.0,
@@ -1145,7 +1145,7 @@ class IronCondorStrategy(BaseStrategy):
         if pnl_pct >= self.profit_target_pct:
             return self._close_position("profit_target", ts, candle.close)
 
-        # 2. Stop-loss
+        # 2. Stop-loss: trigger when loss exceeds multiplier × max_profit
         loss_threshold = pos.max_profit * self.stop_loss_multiplier
         pnl_per_unit = pos.entry_net_premium - self._position_mgr.get_current_net_premium()
         if pnl_per_unit <= -loss_threshold:

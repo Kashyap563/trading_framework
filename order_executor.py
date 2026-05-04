@@ -103,6 +103,18 @@ class OrderExecutorBase(ABC):
         trade.pnl_rupees = trade.pnl_points * trade.quantity
         trade.net_pnl = trade.pnl_rupees - trade.brokerage
 
+        # Merge exit metadata (reason, days_held, pnl_pct) into trade metadata
+        if trade.metadata is None:
+            trade.metadata = {}
+        trade.metadata["reason"] = trade.exit_reason
+        if trade.entry_time and trade.exit_time:
+            days = (trade.exit_time - trade.entry_time).total_seconds() / 86400.0
+            trade.metadata["days_held"] = round(days, 2)
+        # Merge any extra exit metadata from the action
+        for key in ("pnl_pct", "pnl_rupees"):
+            if key in action.metadata and key not in trade.metadata:
+                trade.metadata[key] = action.metadata[key]
+
         self._open_trade = None
         return trade
 

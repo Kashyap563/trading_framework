@@ -1,6 +1,6 @@
-.env
+data/*.csv
 data/*.log
 data/.progress/
-__pycache__/
-*.pyc
-.hypothesis/
+iron_condor_state.json
+*.xlsx
+.env

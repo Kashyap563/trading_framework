@@ -167,6 +167,21 @@ class Backtester:
         trade.pnl_rupees = trade.pnl_points * trade.quantity
         trade.net_pnl = trade.pnl_rupees - trade.brokerage
 
+        # Merge exit metadata from strategy (reason, days_held, pnl_pct, etc.)
+        # into the trade's metadata which already has entry info (expiry, legs, etc.)
+        strategy = self.strategy
+        if hasattr(strategy, '_position_mgr'):
+            # Iron Condor: exit metadata was returned by _close_position
+            # and passed via TradeAction.metadata → action.metadata.get("reason")
+            # But we need to get it from the last action. Instead, store reason
+            # and compute days_held here.
+            if trade.metadata is None:
+                trade.metadata = {}
+            trade.metadata["reason"] = reason
+            if trade.entry_time and trade.exit_time:
+                days = (trade.exit_time - trade.entry_time).total_seconds() / 86400.0
+                trade.metadata["days_held"] = round(days, 2)
+
         self.trades.append(trade)
         logger.debug(
             "Trade #%d exit (%s): price=%.2f, pnl=%.2f pts, reason=%s",
