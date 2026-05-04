@@ -897,7 +897,8 @@ class LiveOptionsProvider:
         """Fetch current India VIX value."""
         today = timestamp.astimezone(IST).date()
         try:
-            candles = self.fetcher.fetch_day_candles(
+            # Use intraday endpoint for today's VIX (historical doesn't have today)
+            candles = self.fetcher.fetch_1min_candles(
                 today, today, instrument_key=self.VIX_INSTRUMENT_KEY,
             )
             if candles:
@@ -972,13 +973,13 @@ class IronCondorStrategy(BaseStrategy):
     def __init__(
         self,
         *,
-        max_vix: float = 100.0,
-        short_strike_delta_min: float = 0.00,
-        short_strike_delta_max: float = 1.00,
+        max_vix: float = 25.0,
+        short_strike_delta_min: float = 0.20,
+        short_strike_delta_max: float = 0.25,
         spread_width: int = 50,
         profit_target_pct: float = 50.0,
         stop_loss_multiplier: float = 2.0,
-        entry_days_before_expiry_min: int = 2,
+        entry_days_before_expiry_min: int = 1,
         entry_days_before_expiry_max: int = 10,
         max_total_capital: float = 100_000.0,
         max_daily_loss: float = 20_000.0,
@@ -1183,8 +1184,9 @@ class IronCondorStrategy(BaseStrategy):
 
             # VIX check using live India VIX
             live_vix = self._live_provider.fetch_vix(ts)
+            logger.info("📊 VIX: %.2f | Max allowed: %.1f | Nifty: %.2f", live_vix, self._max_vix, underlying_close)
             if live_vix > 0 and live_vix > self._max_vix:
-                logger.debug("VIX %.1f > %.1f — skipping entry", live_vix, self._max_vix)
+                logger.info("⛔ VIX %.1f > %.1f — skipping entry", live_vix, self._max_vix)
                 return None
         else:
             options = self._data_loader.get_options_at(ts) if self._data_loader else []
@@ -1196,24 +1198,30 @@ class IronCondorStrategy(BaseStrategy):
                 underlying_close = options[0].underlying_close
 
         if not options:
+            logger.info("⚠️ No options data available")
             return None
 
         if not nearest_expiry:
+            logger.info("⚠️ No nearest expiry found")
             return None
 
         # Check days to expiry
         expiry_date = date.fromisoformat(nearest_expiry)
         dte = (expiry_date - current_date).days
         if not (self.entry_dte_min <= dte <= self.entry_dte_max):
+            logger.info("⚠️ DTE %d not in range [%d, %d] | Expiry: %s", dte, self.entry_dte_min, self.entry_dte_max, nearest_expiry)
             return None
 
-        # VIX filter
-        if not self._vix_filter.is_entry_allowed(options, underlying_close):
-            return None
+        # VIX filter — skip ATM IV proxy in live mode (already checked India VIX above)
+        if not self._is_live_mode:
+            if not self._vix_filter.is_entry_allowed(options, underlying_close):
+                logger.info("⚠️ VIX filter blocked entry (ATM IV proxy too high)")
+                return None
 
         # Select strikes
         legs = self._strike_selector.select(options, underlying_close, nearest_expiry)
         if legs is None:
+            logger.info("⚠️ Strike selection failed — no valid 4-leg combo found")
             return None
 
         # Compute net premium and max loss

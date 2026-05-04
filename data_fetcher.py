@@ -149,8 +149,8 @@ class UpstoxDataFetcher:
     ) -> list[Candle]:
         """Fetch 1-minute candles for a date range, month by month.
 
-        The Upstox API limits 1-minute data to ~1 month per request,
-        so this method iterates month by month across the range.
+        For today's date, uses the intraday endpoint which returns live data.
+        For historical dates, uses the historical candle endpoint.
 
         Args:
             from_date: Start date of the range.
@@ -162,10 +162,19 @@ class UpstoxDataFetcher:
         """
         key = instrument_key or self.instrument_key
         all_candles: list[Candle] = []
-        current_start = from_date
+        today = date.today()
 
-        while current_start < to_date:
-            current_end = min(current_start + timedelta(days=30), to_date)
+        # If range includes today, fetch today's intraday data separately
+        if from_date <= today <= to_date:
+            intraday = self._fetch_intraday_candles(key, "1minute")
+            all_candles.extend(intraday)
+
+        # Fetch historical data for past dates
+        current_start = from_date
+        hist_end = min(to_date, today - timedelta(days=1))
+
+        while current_start <= hist_end:
+            current_end = min(current_start + timedelta(days=30), hist_end)
             chunk = self._fetch_candles_raw(key, "1minute", current_start, current_end)
             all_candles.extend(chunk)
 
@@ -188,6 +197,53 @@ class UpstoxDataFetcher:
         unique.sort(key=lambda x: x.timestamp)
         logger.info("Total unique 1-min candles fetched: %d", len(unique))
         return unique
+
+    def _fetch_intraday_candles(
+        self,
+        instrument_key: str,
+        interval: str,
+    ) -> list[Candle]:
+        """Fetch today's intraday candles using the V2 intraday endpoint."""
+        encoded_key = _encode_instrument_key(instrument_key)
+        url = f"{self.BASE_URL}/historical-candle/intraday/{encoded_key}/{interval}"
+
+        logger.info("Fetching intraday candles for today")
+
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.error("Intraday API request failed: %s", exc)
+            return []
+
+        data = response.json()
+        if data.get("status") != "success":
+            logger.error("Intraday API returned non-success: %s", data)
+            return []
+
+        raw_candles = data.get("data", {}).get("candles", [])
+        if not raw_candles:
+            logger.warning("No intraday candles returned")
+            return []
+
+        candles: list[Candle] = []
+        for c in raw_candles:
+            try:
+                ts = datetime.fromisoformat(c[0])
+                candles.append(Candle(
+                    timestamp=ts,
+                    open=float(c[1]),
+                    high=float(c[2]),
+                    low=float(c[3]),
+                    close=float(c[4]),
+                    volume=int(c[5]) if len(c) > 5 else 0,
+                ))
+            except (IndexError, ValueError, TypeError) as exc:
+                logger.warning("Skipping malformed intraday candle: %s", exc)
+
+        candles.sort(key=lambda x: x.timestamp)
+        logger.info("Fetched %d intraday candles for today", len(candles))
+        return candles
 
     # ------------------------------------------------------------------
     # 5-minute aggregation from 1-minute data
@@ -336,12 +392,37 @@ class UpstoxDataFetcher:
     # Option chain support
     # ------------------------------------------------------------------
 
+    def _get_nearest_expiry(self, instrument_key: str) -> Optional[str]:
+        """Fetch available expiry dates and return the nearest future one."""
+        encoded_key = _encode_instrument_key(instrument_key)
+        url = f"{self.BASE_URL}/option/contract?instrument_key={encoded_key}"
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("status") != "success":
+                return None
+            expiries = set()
+            for c in data.get("data", []):
+                exp = c.get("expiry", "")[:10]
+                if exp:
+                    expiries.add(exp)
+            today = date.today()
+            future = [e for e in expiries if date.fromisoformat(e) >= today]
+            if future:
+                nearest = min(future, key=lambda e: date.fromisoformat(e))
+                logger.info("Nearest expiry: %s (from %d available)", nearest, len(future))
+                return nearest
+        except Exception as exc:
+            logger.error("Failed to fetch expiry dates: %s", exc)
+        return None
+
     def fetch_option_chain(
         self,
         instrument_key: Optional[str] = None,
         expiry_date: Optional[str] = None,
     ) -> list[OptionData]:
-        """Fetch option contracts from the Upstox Option Contracts API.
+        """Fetch option chain with market data from the Upstox Option Chain API.
 
         Args:
             instrument_key: Underlying instrument key (e.g., "NSE_INDEX|Nifty 50").
@@ -349,13 +430,20 @@ class UpstoxDataFetcher:
                          the nearest expiry.
 
         Returns:
-            List of OptionData objects.
+            List of OptionData objects with LTP, greeks, and market data.
         """
         key = instrument_key or self.instrument_key
         encoded_key = _encode_instrument_key(key)
-        url = f"{self.BASE_URL}/option/contract?instrument_key={encoded_key}"
-        if expiry_date:
-            url += f"&expiry_date={expiry_date}"
+
+        # The /option/chain endpoint requires expiry_date.
+        # If not provided, fetch available expiries and use the nearest one.
+        if not expiry_date:
+            expiry_date = self._get_nearest_expiry(key)
+            if not expiry_date:
+                logger.error("Could not determine nearest expiry for %s", key)
+                return []
+
+        url = f"{self.BASE_URL}/option/chain?instrument_key={encoded_key}&expiry_date={expiry_date}"
 
         logger.info("Fetching option chain for %s (expiry=%s)", key, expiry_date)
 
@@ -371,22 +459,66 @@ class UpstoxDataFetcher:
             logger.error("Option chain API returned non-success: %s", data)
             return []
 
-        contracts = data.get("data", [])
+        chain_items = data.get("data", [])
         options: list[OptionData] = []
-        for c in contracts:
+
+        for item in chain_items:
             try:
-                options.append(OptionData(
-                    instrument_key=c.get("instrument_key", ""),
-                    underlying=c.get("underlying_key", key),
-                    expiry=datetime.fromisoformat(c["expiry"]) if c.get("expiry") else datetime.now(),
-                    strike_price=float(c.get("strike_price", 0)),
-                    option_type=c.get("option_type", ""),
-                    ltp=float(c.get("ltp", 0)),
-                    open_interest=int(c.get("open_interest", 0)),
-                    volume=int(c.get("volume", 0)),
-                ))
+                strike = float(item.get("strike_price", 0))
+                expiry_str = item.get("expiry", "")
+                expiry_dt = datetime.fromisoformat(expiry_str) if expiry_str else datetime.now()
+
+                # Process call side
+                call_data = item.get("call_options", {})
+                if call_data:
+                    mkt = call_data.get("market_data", {})
+                    greeks = call_data.get("option_greeks", {})
+                    ltp = float(mkt.get("ltp", 0))
+                    # Use mid-price if LTP is 0 but bid/ask exist
+                    if ltp == 0:
+                        bid = float(mkt.get("bid_price", 0))
+                        ask = float(mkt.get("ask_price", 0))
+                        if bid > 0 and ask > 0:
+                            ltp = round((bid + ask) / 2, 2)
+                    options.append(OptionData(
+                        instrument_key=call_data.get("instrument_key", ""),
+                        underlying=item.get("underlying_key", key),
+                        expiry=expiry_dt,
+                        strike_price=strike,
+                        option_type="CE",
+                        ltp=ltp,
+                        open_interest=int(mkt.get("oi", 0)),
+                        volume=int(mkt.get("volume", 0)),
+                        implied_volatility=float(greeks.get("iv", 0)),
+                        delta=float(greeks.get("delta", 0)),
+                    ))
+
+                # Process put side
+                put_data = item.get("put_options", {})
+                if put_data:
+                    mkt = put_data.get("market_data", {})
+                    greeks = put_data.get("option_greeks", {})
+                    ltp = float(mkt.get("ltp", 0))
+                    if ltp == 0:
+                        bid = float(mkt.get("bid_price", 0))
+                        ask = float(mkt.get("ask_price", 0))
+                        if bid > 0 and ask > 0:
+                            ltp = round((bid + ask) / 2, 2)
+                    options.append(OptionData(
+                        instrument_key=put_data.get("instrument_key", ""),
+                        underlying=item.get("underlying_key", key),
+                        expiry=expiry_dt,
+                        strike_price=strike,
+                        option_type="PE",
+                        ltp=ltp,
+                        open_interest=int(mkt.get("oi", 0)),
+                        volume=int(mkt.get("volume", 0)),
+                        implied_volatility=float(greeks.get("iv", 0)),
+                        delta=float(greeks.get("delta", 0)),
+                    ))
+
             except (KeyError, ValueError, TypeError) as exc:
-                logger.warning("Skipping malformed option contract: %s", exc)
+                logger.warning("Skipping malformed option chain item: %s", exc)
 
         logger.info("Fetched %d option contracts", len(options))
         return options
