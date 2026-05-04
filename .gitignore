@@ -7,3 +7,6 @@ data/.progress/
 iron_condor_state.json
 *.xlsx
 .env
+*_paper.log
+*_paper_trades.json
+*_sandbox.log
