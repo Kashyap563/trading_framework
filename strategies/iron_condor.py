@@ -979,7 +979,7 @@ class IronCondorStrategy(BaseStrategy):
         spread_width: int = 50,
         profit_target_pct: float = 50.0,
         stop_loss_multiplier: float = 2.0,
-        entry_days_before_expiry_min: int = 1,
+        entry_days_before_expiry_min: int = 0,
         entry_days_before_expiry_max: int = 10,
         max_total_capital: float = 100_000.0,
         max_daily_loss: float = 20_000.0,
@@ -1079,8 +1079,9 @@ class IronCondorStrategy(BaseStrategy):
             lot_size=self.default_lot_size,
         )
 
-        # Restore persisted state if available
-        self._load_state()
+        # Restore persisted state if available (live/paper/sandbox only)
+        if self._is_live_mode:
+            self._load_state()
 
         logger.info(
             "🔷 Iron Condor strategy initialized | "
@@ -1141,6 +1142,14 @@ class IronCondorStrategy(BaseStrategy):
 
         pnl_pct = self._position_mgr.get_pnl_pct_of_max_profit()
         pnl_rupees = self._position_mgr.get_current_pnl()
+
+        logger.info(
+            "📈 Position monitor | Nifty=%.2f | P&L=%.1f%% (₹%.0f) | "
+            "Target=%d%% | Expiry=%s | Time=%s",
+            candle.close, pnl_pct, pnl_rupees,
+            self.profit_target_pct, pos.legs.expiry,
+            current_time.strftime("%H:%M"),
+        )
 
         # 1. Profit target
         if pnl_pct >= self.profit_target_pct:
@@ -1318,8 +1327,9 @@ class IronCondorStrategy(BaseStrategy):
         # Block margin for this position
         self._risk.block_margin(estimated_margin_total)
 
-        # Save state after entry
-        self._save_state()
+        # Save state after entry (live/paper/sandbox only)
+        if self._is_live_mode:
+            self._save_state()
 
         logger.info(
             "🔷 IRON CONDOR ENTRY | Expiry %s | %d lots (%d units) | "
@@ -1375,6 +1385,11 @@ class IronCondorStrategy(BaseStrategy):
         if pos is None or self._live_provider is None:
             return
 
+        # Refresh option chain each candle to get current premiums
+        self._live_provider.fetch_option_chain_as_records(
+            ts, pos.legs.underlying_price,
+        )
+
         legs = pos.legs
         for attr, ikey in [
             ("current_short_call_premium", legs.short_call_instrument_key),
@@ -1407,8 +1422,9 @@ class IronCondorStrategy(BaseStrategy):
 
         self._risk.record_trade_result(pnl_rupees, margin_released=margin_to_release)
 
-        # Save state after exit
-        self._save_state()
+        # Save state after exit (live/paper/sandbox only)
+        if self._is_live_mode:
+            self._save_state()
 
         emoji = "✅" if pnl_rupees > 0 else "❌"
         logger.info(
@@ -1428,7 +1444,9 @@ class IronCondorStrategy(BaseStrategy):
 
     def on_end(self) -> None:
         """Save state when strategy ends (market close or backtest complete)."""
-        self._save_state()
+        # Only persist state in live/paper/sandbox — backtest must not touch state file
+        if self._is_live_mode:
+            self._save_state()
         if self._risk:
             state = self._risk.state
             logger.info(
