@@ -1056,7 +1056,8 @@ class IronCondorStrategy(BaseStrategy):
         # In live mode, skip CSV loading — data comes from LiveOptionsProvider
         if self._is_live_mode:
             self._data_loader = None
-        else:
+        elif self._data_loader is None or not self._data_loader._loaded:
+            # Only load if not already injected (optimization pre-loads once)
             self._data_loader = OptionsDataLoader(self.options_csv_path)
             if not self._data_loader.load():
                 self._disabled = True
@@ -1285,16 +1286,6 @@ class IronCondorStrategy(BaseStrategy):
 
         # Log all candidates
         candidates.sort(key=lambda c: c["score"], reverse=True)
-        logger.info(
-            "📋 %d expiry candidates found | Best: %s (DTE=%d, score=%.3f) | "
-            "All: %s",
-            len(candidates),
-            candidates[0]["expiry"], candidates[0]["dte"], candidates[0]["score"],
-            ", ".join(
-                f"{c['expiry']}(DTE={c['dte']},₹{c['net_premium']:.1f},score={c['score']:.3f})"
-                for c in candidates
-            ),
-        )
 
         # Pick the best candidate
         best = candidates[0]
@@ -1398,7 +1389,7 @@ class IronCondorStrategy(BaseStrategy):
             "Call: Sell %.0f/Buy %.0f | Put: Sell %.0f/Buy %.0f | "
             "Premium ₹%.1f/unit (₹%.0f total) | Max loss ₹%.0f | "
             "Margin ₹%.0f | Score %.3f (R/R=%.2f, θ/day=%.2f) | "
-            "Picked from %d candidates",
+            "Picked from %d candidates: %s",
             nearest_expiry, dte, num_lots, total_quantity,
             legs.short_call_strike, legs.long_call_strike,
             legs.short_put_strike, legs.long_put_strike,
@@ -1407,6 +1398,10 @@ class IronCondorStrategy(BaseStrategy):
             estimated_margin_total,
             best["score"], best["reward_risk"], best["daily_theta"],
             len(candidates),
+            ", ".join(
+                f"{c['expiry']}(DTE={c['dte']},₹{c['net_premium']:.1f},score={c['score']:.3f})"
+                for c in candidates
+            ),
         )
 
         # Build entry metadata
