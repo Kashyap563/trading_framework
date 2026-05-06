@@ -291,23 +291,15 @@ class LiveTrader:
                 )
 
                 if daemon:
-                    # Check if today was expiry day — if so, terminate the cycle
-                    # User must manually restart for the next expiry cycle
+                    # Sleep until next trading day — regardless of position state
+                    # Strategy will re-evaluate entries on the next day
                     strategy_pos = self.strategy.get_position()
-                    if strategy_pos == "flat":
-                        logger.info(
-                            "🔄 DAEMON: Expiry cycle complete. "
-                            "Restart manually for next cycle: "
-                            "python -m trading_framework.run --strategy %s --mode %s --daemon",
-                            self.strategy.name, mode,
-                        )
-                        break
-
-                    # Position still open (swing trade) — sleep until next trading day
                     next_open = self._next_trading_day_open(now)
                     sleep_seconds = (next_open - now).total_seconds()
                     logger.info(
-                        "🔄 DAEMON: Position open, sleeping until %s (%.1f hours)",
+                        "🔄 DAEMON: Market closed | Position: %s | "
+                        "Sleeping until %s (%.1f hours)",
+                        strategy_pos,
                         next_open.strftime("%Y-%m-%d %H:%M IST"),
                         sleep_seconds / 3600,
                     )

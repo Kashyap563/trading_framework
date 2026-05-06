@@ -1143,7 +1143,7 @@ class IronCondorStrategy(BaseStrategy):
         pnl_pct = self._position_mgr.get_pnl_pct_of_max_profit()
         pnl_rupees = self._position_mgr.get_current_pnl()
 
-        logger.info(
+        logger.debug(
             "📈 Position monitor | Nifty=%.2f | P&L=%.1f%% (₹%.0f) | "
             "Target=%d%% | Expiry=%s | Time=%s",
             candle.close, pnl_pct, pnl_rupees,
@@ -1177,8 +1177,11 @@ class IronCondorStrategy(BaseStrategy):
         self, candle: Candle, ts: datetime, ist_ts: datetime,
         current_date: date, current_time: time,
     ) -> Optional[TradeAction]:
-        """Check entry conditions and open a new position if all gates pass."""
-        # Only evaluate once per 5-minute window to avoid excessive processing
+        """Check entry conditions and open a new position if all gates pass.
+
+        Evaluates ALL available expiries within the DTE range, scores each
+        candidate by (premium/max_loss) × (premium/DTE), and picks the best.
+        """
         if current_time < MARKET_OPEN:
             return None
 
@@ -1189,7 +1192,6 @@ class IronCondorStrategy(BaseStrategy):
             options = self._live_provider.fetch_option_chain_as_records(
                 ts, underlying_close,
             )
-            nearest_expiry = self._live_provider.get_nearest_expiry(ts)
 
             # VIX check using live India VIX
             live_vix = self._live_provider.fetch_vix(ts)
@@ -1197,63 +1199,113 @@ class IronCondorStrategy(BaseStrategy):
             if live_vix > 0 and live_vix > self._max_vix:
                 logger.info("⛔ VIX %.1f > %.1f — skipping entry", live_vix, self._max_vix)
                 return None
+
+            # Get all available expiries from cached option chain
+            all_expiries = sorted(self._live_provider._cached_expiries)
         else:
             options = self._data_loader.get_options_at(ts) if self._data_loader else []
-            nearest_expiry = self._data_loader.get_nearest_expiry(ts) if self._data_loader else None
 
-            # Use underlying_close from options data if available (handles
-            # case where candle source is the options CSV itself)
             if options and options[0].underlying_close > 0:
                 underlying_close = options[0].underlying_close
 
+            # Get all expiries available at this timestamp
+            if self._data_loader:
+                ts_min = _truncate_timestamp(ts.isoformat())
+                all_expiries = sorted(
+                    self._data_loader._expiries_by_timestamp.get(ts_min, set())
+                )
+            else:
+                all_expiries = []
+
         if not options:
-            logger.info("⚠️ No options data available")
             return None
 
-        if not nearest_expiry:
-            logger.info("⚠️ No nearest expiry found")
+        if not all_expiries:
             return None
 
-        # Check days to expiry
-        expiry_date = date.fromisoformat(nearest_expiry)
-        dte = (expiry_date - current_date).days
-        if not (self.entry_dte_min <= dte <= self.entry_dte_max):
-            logger.info("⚠️ DTE %d not in range [%d, %d] | Expiry: %s", dte, self.entry_dte_min, self.entry_dte_max, nearest_expiry)
-            return None
-
-        # VIX filter — skip ATM IV proxy in live mode (already checked India VIX above)
+        # VIX filter (backtest mode — uses ATM IV proxy)
         if not self._is_live_mode:
             if not self._vix_filter.is_entry_allowed(options, underlying_close):
-                logger.info("⚠️ VIX filter blocked entry (ATM IV proxy too high)")
                 return None
 
-        # Select strikes
-        legs = self._strike_selector.select(options, underlying_close, nearest_expiry)
-        if legs is None:
-            logger.info("⚠️ Strike selection failed — no valid 4-leg combo found")
+        # --- Evaluate all expiries within DTE range ---
+        candidates = []
+        for expiry_str in all_expiries:
+            expiry_date = date.fromisoformat(expiry_str)
+            dte = (expiry_date - current_date).days
+            if not (self.entry_dte_min <= dte <= self.entry_dte_max):
+                continue
+
+            # Try strike selection for this expiry
+            legs = self._strike_selector.select(options, underlying_close, expiry_str)
+            if legs is None:
+                continue
+
+            # Compute net premium and max loss
+            net_premium = (
+                (legs.short_call_premium + legs.short_put_premium)
+                - (legs.long_call_premium + legs.long_put_premium)
+            )
+            max_loss_per_unit = self.spread_width - net_premium
+
+            if net_premium <= 0 or max_loss_per_unit <= 0:
+                continue
+
+            # Check margin fits within available capital
+            call_spread_net = legs.short_call_premium - legs.long_call_premium
+            put_spread_net = legs.short_put_premium - legs.long_put_premium
+            call_spread_margin = self.spread_width - call_spread_net
+            put_spread_margin = self.spread_width - put_spread_net
+            estimated_margin_per_unit = max(call_spread_margin, put_spread_margin)
+            margin_per_lot = estimated_margin_per_unit * self.default_lot_size
+
+            available = self._risk.get_available_capital()
+            if margin_per_lot > available:
+                continue
+
+            # Score: (premium/max_loss) × (premium/DTE) — higher = quicker profit, lower risk
+            reward_risk = net_premium / max_loss_per_unit
+            daily_theta = net_premium / max(dte, 1)
+            score = reward_risk * daily_theta
+
+            candidates.append({
+                "expiry": expiry_str,
+                "dte": dte,
+                "legs": legs,
+                "net_premium": net_premium,
+                "max_loss_per_unit": max_loss_per_unit,
+                "margin_per_unit": estimated_margin_per_unit,
+                "score": score,
+                "reward_risk": reward_risk,
+                "daily_theta": daily_theta,
+            })
+
+        if not candidates:
             return None
 
-        # Compute net premium and max loss
-        net_premium = (
-            (legs.short_call_premium + legs.short_put_premium)
-            - (legs.long_call_premium + legs.long_put_premium)
+        # Log all candidates
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        logger.info(
+            "📋 %d expiry candidates found | Best: %s (DTE=%d, score=%.3f) | "
+            "All: %s",
+            len(candidates),
+            candidates[0]["expiry"], candidates[0]["dte"], candidates[0]["score"],
+            ", ".join(
+                f"{c['expiry']}(DTE={c['dte']},₹{c['net_premium']:.1f},score={c['score']:.3f})"
+                for c in candidates
+            ),
         )
-        max_loss_per_unit = self.spread_width - net_premium
 
-        # Check if trade is profitable after brokerage
-        # This is a preliminary check with 1 lot — final check happens after lot sizing
-        # Skip only if even max possible lots can't cover brokerage
-        if net_premium <= 0:
-            logger.debug("Net premium non-positive (₹%.1f) — skipping", net_premium)
-            return None
-
-        if max_loss_per_unit <= 0:
-            logger.debug("Max loss non-positive — skipping")
-            return None
+        # Pick the best candidate
+        best = candidates[0]
+        legs = best["legs"]
+        net_premium = best["net_premium"]
+        max_loss_per_unit = best["max_loss_per_unit"]
+        nearest_expiry = best["expiry"]
+        dte = best["dte"]
+        estimated_margin_per_unit = best["margin_per_unit"]
 
         # --- Dynamic lot sizing ---
-        # Remaining daily loss budget = max_daily_loss - losses already taken today
-        # If daily P&L is -5000, remaining budget = 20000 - 5000 = 15000
         daily_loss_so_far = abs(min(0.0, self._risk.state.daily_realized_pnl))
         remaining_daily_budget = max(0.0, self._max_daily_loss - daily_loss_so_far)
 
@@ -1266,14 +1318,21 @@ class IronCondorStrategy(BaseStrategy):
         # Constraint 1: max loss for this trade ≤ remaining daily budget
         lots_by_risk = int(remaining_daily_budget / max_loss_per_lot) if max_loss_per_lot > 0 else 0
 
-        # Constraint 2: margin must fit within available capital (tracks realized P&L)
-        call_spread_net = legs.short_call_premium - legs.long_call_premium
-        put_spread_net = legs.short_put_premium - legs.long_put_premium
-        call_spread_margin = self.spread_width - call_spread_net
-        put_spread_margin = self.spread_width - put_spread_net
-        estimated_margin_per_unit = max(call_spread_margin, put_spread_margin)
+        # Constraint 2: margin must fit within available capital
         margin_per_lot = estimated_margin_per_unit * self.default_lot_size
         available = self._risk.get_available_capital()
+        if self._is_live_mode and self._live_provider:
+            try:
+                upstox_available = self._live_provider.fetcher.fetch_available_margin()
+                if upstox_available > 0:
+                    available = min(available, upstox_available)
+                    logger.info(
+                        "💰 Capital: internal=₹%.0f | Upstox=₹%.0f | Using=₹%.0f",
+                        self._risk.get_available_capital(), upstox_available, available,
+                    )
+            except Exception as exc:
+                logger.warning("Could not fetch Upstox margin: %s — using internal", exc)
+
         lots_by_capital = int(available / margin_per_lot) if margin_per_lot > 0 else 0
 
         # Take the minimum, at least 1 lot
@@ -1290,21 +1349,24 @@ class IronCondorStrategy(BaseStrategy):
         total_quantity = num_lots * self.default_lot_size
         estimated_margin_total = margin_per_lot * num_lots
 
-        # Brokerage profitability check: at 50% profit target,
-        # total profit must exceed brokerage (₹700)
-        profit_at_50pct = net_premium * 0.5 * total_quantity
-        if profit_at_50pct <= self.brokerage_per_trade:
+        # Brokerage profitability check
+        profit_at_target = net_premium * (self.profit_target_pct / 100.0) * total_quantity
+        if profit_at_target <= self.brokerage_per_trade:
             logger.debug(
-                "Not profitable after brokerage: 50%% profit ₹%.0f "
+                "Not profitable after brokerage: target profit ₹%.0f "
                 "≤ brokerage ₹%.0f on %d units — skipping",
-                profit_at_50pct, self.brokerage_per_trade, total_quantity,
+                profit_at_target, self.brokerage_per_trade, total_quantity,
             )
             return None
 
         # Check if it's expiry day
+        expiry_date = date.fromisoformat(nearest_expiry)
         is_expiry_day = (current_date == expiry_date)
 
-        # Run 8 risk gates (pass actual dynamic quantities for accurate checks)
+        # Run risk gates
+        call_spread_margin = self.spread_width - (legs.short_call_premium - legs.long_call_premium)
+        put_spread_margin = self.spread_width - (legs.short_put_premium - legs.long_put_premium)
+
         allowed, reason = self._risk.check_entry_allowed(
             proposed_max_loss=max_loss_per_unit,
             net_premium_per_unit=net_premium,
@@ -1320,31 +1382,31 @@ class IronCondorStrategy(BaseStrategy):
             logger.debug("Entry blocked: %s", reason)
             return None
 
-        # Open position (with dynamic lot sizing)
+        # Open position
         pos = self._position_mgr.open_position(legs, ts, self.spread_width)
-        pos.lot_size = total_quantity  # Override with dynamic quantity
+        pos.lot_size = total_quantity
 
-        # Block margin for this position
+        # Block margin
         self._risk.block_margin(estimated_margin_total)
 
-        # Save state after entry (live/paper/sandbox only)
+        # Save state (live/paper/sandbox only)
         if self._is_live_mode:
             self._save_state()
 
         logger.info(
-            "🔷 IRON CONDOR ENTRY | Expiry %s | %d lots (%d units) | "
+            "🔷 IRON CONDOR ENTRY | Expiry %s (DTE %d) | %d lots (%d units) | "
             "Call: Sell %.0f/Buy %.0f | Put: Sell %.0f/Buy %.0f | "
             "Premium ₹%.1f/unit (₹%.0f total) | Max loss ₹%.0f | "
-            "Margin ₹%.0f | Available after ₹%.0f | Daily budget left ₹%.0f | DTE %d",
-            nearest_expiry, num_lots, total_quantity,
+            "Margin ₹%.0f | Score %.3f (R/R=%.2f, θ/day=%.2f) | "
+            "Picked from %d candidates",
+            nearest_expiry, dte, num_lots, total_quantity,
             legs.short_call_strike, legs.long_call_strike,
             legs.short_put_strike, legs.long_put_strike,
             net_premium, net_premium * total_quantity,
             max_loss_per_unit * total_quantity,
             estimated_margin_total,
-            self._risk.get_available_capital() - estimated_margin_total,
-            remaining_daily_budget - (max_loss_per_lot * num_lots),
-            dte,
+            best["score"], best["reward_risk"], best["daily_theta"],
+            len(candidates),
         )
 
         # Build entry metadata

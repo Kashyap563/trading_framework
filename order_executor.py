@@ -247,9 +247,9 @@ class SandboxOrderExecutor(OrderExecutorBase):
             "quantity": self.lot_size,
             "product": "I",
             "validity": "DAY",
-            "price": 0,
+            "price": round(price, 2),
             "instrument_token": self.instrument_token,
-            "order_type": "MARKET",
+            "order_type": "LIMIT",
             "transaction_type": transaction_type,
             "disclosed_quantity": 0,
             "trigger_price": 0,
@@ -338,9 +338,9 @@ class LiveOrderExecutor(OrderExecutorBase):
             "quantity": self.lot_size,
             "product": "I",
             "validity": "DAY",
-            "price": 0,
+            "price": round(price, 2),
             "instrument_token": self.instrument_token,
-            "order_type": "MARKET",
+            "order_type": "LIMIT",
             "transaction_type": transaction_type,
             "disclosed_quantity": 0,
             "trigger_price": 0,
@@ -348,7 +348,7 @@ class LiveOrderExecutor(OrderExecutorBase):
         }
         try:
             logger.warning(
-                "🔴 LIVE ORDER: %s %d x %s @ market (≈%.2f)",
+                "🔴 LIVE ORDER: %s %d x %s @ LIMIT ₹%.2f",
                 transaction_type, self.lot_size, self.instrument_token, price,
             )
             response = self.session.post(self.base_url, json=payload, timeout=10)

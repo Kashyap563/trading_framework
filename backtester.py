@@ -122,7 +122,7 @@ class Backtester:
         elif signal in (Signal.EXIT, Signal.EXIT_LONG, Signal.EXIT_SHORT):
             if self._current_trade is not None:
                 reason = action.metadata.get("reason", "signal")
-                self._close_trade(action.price, action.timestamp, reason)
+                self._close_trade(action.price, action.timestamp, reason, action.metadata)
 
     def _open_trade(
         self,
@@ -149,7 +149,7 @@ class Backtester:
             self._trade_counter, direction, price, timestamp,
         )
 
-    def _close_trade(self, price: float, timestamp, reason: str) -> None:
+    def _close_trade(self, price: float, timestamp, reason: str, action_metadata: dict | None = None) -> None:
         """Close the current open trade."""
         trade = self._current_trade
         if trade is None:
@@ -167,20 +167,15 @@ class Backtester:
         trade.pnl_rupees = trade.pnl_points * trade.quantity
         trade.net_pnl = trade.pnl_rupees - trade.brokerage
 
-        # Merge exit metadata from strategy (reason, days_held, pnl_pct, etc.)
-        # into the trade's metadata which already has entry info (expiry, legs, etc.)
-        strategy = self.strategy
-        if hasattr(strategy, '_position_mgr'):
-            # Iron Condor: exit metadata was returned by _close_position
-            # and passed via TradeAction.metadata → action.metadata.get("reason")
-            # But we need to get it from the last action. Instead, store reason
-            # and compute days_held here.
-            if trade.metadata is None:
-                trade.metadata = {}
-            trade.metadata["reason"] = reason
-            if trade.entry_time and trade.exit_time:
-                days = (trade.exit_time - trade.entry_time).total_seconds() / 86400.0
-                trade.metadata["days_held"] = round(days, 2)
+        # Merge exit metadata from strategy into trade metadata
+        if trade.metadata is None:
+            trade.metadata = {}
+        if action_metadata:
+            trade.metadata.update(action_metadata)
+        trade.metadata["reason"] = reason
+        if trade.entry_time and trade.exit_time:
+            days = (trade.exit_time - trade.entry_time).total_seconds() / 86400.0
+            trade.metadata["days_held"] = round(days, 2)
 
         self.trades.append(trade)
         logger.debug(

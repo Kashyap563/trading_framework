@@ -61,6 +61,31 @@ class UpstoxDataFetcher:
         })
 
     # ------------------------------------------------------------------
+    # Funds / Margin
+    # ------------------------------------------------------------------
+
+    def fetch_available_margin(self) -> float:
+        """Fetch available margin/funds from Upstox account.
+
+        Returns:
+            Available margin in rupees. Returns 0.0 on failure.
+        """
+        url = f"{self.BASE_URL}/user/get-funds-and-margin"
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("status") == "success":
+                # Upstox returns commodity and equity segments
+                equity = data.get("data", {}).get("equity", {})
+                available = equity.get("available_margin", 0.0)
+                logger.info("Upstox available margin: ₹%.2f", available)
+                return float(available)
+        except Exception as exc:
+            logger.warning("Failed to fetch margin from Upstox: %s", exc)
+        return 0.0
+
+    # ------------------------------------------------------------------
     # Core candle fetching
     # ------------------------------------------------------------------
 
