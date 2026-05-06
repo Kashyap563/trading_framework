@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trading_framework.backtester import Backtester
 from trading_framework.data_fetcher import load_from_csv
 from trading_framework.models import Candle
-from trading_framework.strategies.iron_condor import IronCondorStrategy
+from trading_framework.strategies.iron_condor import IronCondorStrategy, OptionsDataLoader
 
 IST = ZoneInfo("Asia/Kolkata")
 logger = logging.getLogger(__name__)
@@ -202,9 +202,17 @@ def compute_score_from_trades(trades: list) -> tuple[float, dict]:
 def create_objective(train_candles: list[Candle]):
     """Create the Optuna objective function with train data in closure."""
 
+    # Pre-load options data ONCE — shared across all trials (read-only)
+    logger.info("Pre-loading options data (this takes a few minutes)...")
+    shared_data_loader = OptionsDataLoader(OPTIONS_CSV)
+    if not shared_data_loader.load():
+        logger.error("Failed to pre-load options data")
+        sys.exit(1)
+    logger.info("Options data pre-loaded — ready for optimization")
+
     def objective(trial: Trial) -> float:
         # --- Sample parameters ---
-        max_vix = trial.suggest_float("max_vix", 12.0, 28.0, step=1.0)
+        max_vix = trial.suggest_float("max_vix", 12.0, 30.0, step=1.0)
         delta_min = trial.suggest_float("delta_min", 0.08, 0.20, step=0.02)
         delta_max = trial.suggest_float("delta_max", 0.18, 0.35, step=0.02)
 
@@ -256,16 +264,21 @@ def create_objective(train_candles: list[Candle]):
                 options_csv_path=OPTIONS_CSV,
             )
 
+            # Inject pre-loaded data to skip CSV reload
+            strategy._data_loader = shared_data_loader
+
             backtester = Backtester(strategy)
             result = backtester.run(train_candles)
 
             score, metrics = compute_score_from_trades(result.trades)
 
-            # Log progress
+            # Log progress — all parameters
             logger.info(
                 "Trial %d: score=%.2f | trades=%d | win=%.0f%% | pf=%.2f | "
-                "net=₹%.0f | dd=₹%.0f | vix<%.0f | delta=%.2f-%.2f | "
-                "spread=%d | target=%d%% | sl=%.1fx",
+                "net=\u20b9%.0f | dd=\u20b9%.0f | vix<%.0f | delta=%.2f-%.2f | "
+                "spread=%d | target=%d%% | sl=%.1fx | dte=%d-%d | "
+                "daily_loss=\u20b9%.0f | weekly_loss=\u20b9%.0f | consec=%d | "
+                "min_prem=%.0f | cap_per_pos=\u20b9%.0f",
                 trial.number, score,
                 metrics.get("total_trades", 0),
                 metrics.get("win_rate", 0),
@@ -274,6 +287,10 @@ def create_objective(train_candles: list[Candle]):
                 metrics.get("max_drawdown", 0),
                 max_vix, delta_min, delta_max, spread_width,
                 profit_target_pct, stop_loss_multiplier,
+                entry_dte_min, entry_dte_max,
+                max_daily_loss, max_weekly_loss,
+                max_consecutive_losses, min_premium,
+                max_capital_per_position,
             )
 
             return score
@@ -283,11 +300,6 @@ def create_objective(train_candles: list[Candle]):
             return 0.0
 
     return objective
-
-
-# ---------------------------------------------------------------------------
-# Validation on Test Set
-# ---------------------------------------------------------------------------
 
 def validate_best_params(params: dict, test_candles: list[Candle]) -> tuple:
     """Run backtest with best params on test data. Returns (result, score, metrics)."""
@@ -306,7 +318,7 @@ def validate_best_params(params: dict, test_candles: list[Candle]) -> tuple:
         max_loss_pct_of_capital=20.0,
         max_consecutive_losses=params["max_consecutive_losses"],
         min_premium_per_unit=params["min_premium"],
-        max_capital_per_position=params["max_capital_per_position"],
+        max_capital_per_position=params.get("max_capital_per_position", 12000.0),
         options_csv_path=OPTIONS_CSV,
     )
 
@@ -369,8 +381,8 @@ def generate_report(
             for t in train_result.trades:
                 meta = getattr(t, "metadata", {}) or {}
                 train_trades.append({
-                    "entry_time": t.entry_time,
-                    "exit_time": t.exit_time,
+                    "entry_time": t.entry_time.replace(tzinfo=None) if t.entry_time else None,
+                    "exit_time": t.exit_time.replace(tzinfo=None) if t.exit_time else None,
                     "pnl_rupees": meta.get("pnl_rupees", 0),
                     "pnl_pct": meta.get("pnl_pct", 0),
                     "days_held": meta.get("days_held", 0),
@@ -384,8 +396,8 @@ def generate_report(
             for t in test_result.trades:
                 meta = getattr(t, "metadata", {}) or {}
                 test_trades.append({
-                    "entry_time": t.entry_time,
-                    "exit_time": t.exit_time,
+                    "entry_time": t.entry_time.replace(tzinfo=None) if t.entry_time else None,
+                    "exit_time": t.exit_time.replace(tzinfo=None) if t.exit_time else None,
                     "pnl_rupees": meta.get("pnl_rupees", 0),
                     "pnl_pct": meta.get("pnl_pct", 0),
                     "days_held": meta.get("days_held", 0),

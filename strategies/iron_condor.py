@@ -189,13 +189,25 @@ class OptionsDataLoader:
                             instrument_key=ikey,
                         )
 
-                        # Primary index
+                        # Primary index — deduplicate by contract key
+                        # If same (timestamp, expiry, strike, type) appears again,
+                        # replace the old record to stay consistent with _by_contract
+                        contract_key = (ts_min, expiry, strike, opt_type)
+                        old_record = self._by_contract.get(contract_key)
+
                         if ts_min not in self._by_timestamp:
                             self._by_timestamp[ts_min] = []
+
+                        if old_record is not None:
+                            # Replace in _by_timestamp list
+                            try:
+                                self._by_timestamp[ts_min].remove(old_record)
+                            except ValueError:
+                                pass
+
                         self._by_timestamp[ts_min].append(record)
 
-                        # Secondary index
-                        contract_key = (ts_min, expiry, strike, opt_type)
+                        # Secondary index — always latest wins
                         self._by_contract[contract_key] = record
 
                         # Expiry index
@@ -405,15 +417,17 @@ class StrikeSelector:
             logger.debug("No options for expiry %s", expiry)
             return None
 
-        # OTM calls: strike > underlying
+        # OTM calls: strike > underlying, delta within allowed range
         otm_calls = [
             r for r in expiry_options
             if r.option_type == "CE" and r.strike_price > underlying_close and r.close > 0
+            and self.delta_min <= abs(r.delta) <= self.delta_max
         ]
-        # OTM puts: strike < underlying
+        # OTM puts: strike < underlying, delta within allowed range
         otm_puts = [
             r for r in expiry_options
             if r.option_type == "PE" and r.strike_price < underlying_close and r.close > 0
+            and self.delta_min <= abs(r.delta) <= self.delta_max
         ]
 
         if not otm_calls or not otm_puts:
