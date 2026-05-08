@@ -303,7 +303,9 @@ class LiveTrader:
                         next_open.strftime("%Y-%m-%d %H:%M IST"),
                         sleep_seconds / 3600,
                     )
-                    time.sleep(sleep_seconds)
+                    # Poll-based sleep — wakes reliably even after macOS sleep/hibernate
+                    while datetime.now(IST) < next_open:
+                        time.sleep(60)
 
                     # Refresh token from .env (you update it each morning)
                     self._refresh_token_from_env()
